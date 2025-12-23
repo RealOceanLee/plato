@@ -1,120 +1,124 @@
 # maskcrypt_client.py
 import torch
-import numpy as np
-from typing import Dict, Any, List, Tuple
-from config_manager import ConfigManager
-from ckks_encoder import CKKSEncoder, VectorOperations
-from weight_processor import WeightProcessor
+import copy
+from torch.utils.data import DataLoader, Subset
 
 
 class MaskCryptClient:
-    """MaskCrypt客户端，支持选择性加密和完整权重上传"""
-
-    def __init__(self, client_id: int, config: ConfigManager):
+    def __init__(self, client_id, config, dataset, is_byzantine=False, model_class=None):
         self.client_id = client_id
         self.config = config
-        self.encoder = CKKSEncoder(N=8192, scaling_factor=2 ** 40)
-        self.vector_ops = VectorOperations(self.encoder)
-        self.processor = WeightProcessor(self.encoder)
+        self.dataset = dataset
+        self.is_byzantine = is_byzantine
+        self.model_class = model_class
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # 客户端状态
-        self.data_size = 0
-        self.correlation = 0.0
-        self.priority = 0.0
-        self.mask_proposal = []
+        # 攻击类型从配置读取，默认为 random_weights
+        self.attack_type = config.get('byzantine_attack_type', 'random')
+
+        # 缓存本地结果
         self.local_weights = None
+        self.weight_update = None
         self.global_weights = None
 
-    def set_data_size(self, data_size: int):
-        """设置客户端数据量"""
-        self.data_size = data_size
+        # 初始化时打印拜占庭身份
+        if self.is_byzantine:
+            print(f"  😈 客户端 {self.client_id} 初始化为拜占庭节点 | 攻击类型: {self.attack_type}")
 
-    def compute_mask_proposal(self, local_weights: Dict[str, torch.Tensor],
-                              global_weights: Dict[str, torch.Tensor],
-                              gradients: Dict[str, torch.Tensor]) -> Tuple[List[int], float]:
-        """
-        计算掩码提案，选择最重要的权重进行加密
-        """
-        self.local_weights = local_weights
-        self.global_weights = global_weights
+    def get_data(self, max_samples=200):
+        """用于预聚类阶段采样少量明文数据"""
+        if len(self.dataset) == 0:
+            raise ValueError(f"客户端 {self.client_id} 数据集为空")
+        n_samples = min(max_samples, len(self.dataset))
+        indices = torch.randperm(len(self.dataset))[:n_samples]
+        subset = Subset(self.dataset, indices)
+        loader = DataLoader(subset, batch_size=n_samples, shuffle=False)
+        data, targets = next(iter(loader))
+        return data.to(self.device), targets.to(self.device)
 
-        # 展平权重和梯度
-        local_flat = self._flatten_weights(local_weights)
-        global_flat = self._flatten_weights(global_weights)
-        gradients_flat = self._flatten_gradients(gradients)
+    def update_global_weights(self, global_weights):
+        # ✅ 优化：直接存储权重，不改变设备
+        self.global_weights = copy.deepcopy(global_weights)
 
-        # 计算重要性分数
-        importance = self.vector_ops.compute_weight_importance(local_flat, gradients_flat)
+    def local_train(self, global_weights, epochs=1, current_round=1):
+        # ✅ 优化：直接使用传入的权重，避免设备转换
+        if not hasattr(self, 'model') or self.model is None:
+            self.model = self.model_class().to(self.device)
 
-        # 选择最重要的参数进行加密
-        encrypt_ratio = self.config.encrypt_ratio
-        mask_size = int(encrypt_ratio * len(local_flat))
-        self.mask_proposal = np.argsort(importance)[-mask_size:].tolist()
+        # 直接加载权重到设备
+        self.model.load_state_dict(global_weights)
 
-        # 计算相关系数和优先级
-        self.correlation = self.vector_ops.compute_pearson_correlation(local_flat, global_flat)
+        self.model.train()
 
-        # 估算总数据量（在实际应用中应从服务器获取）
-        total_data_size = self.config.total_clients * self.data_size
-        self.priority = self.vector_ops.compute_client_priority(
-            self.data_size, total_data_size, self.correlation
+        # ✅ 安全获取学习率
+        lr = self.config.get('learning_rate', 0.01)
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=lr)
+        criterion = torch.nn.CrossEntropyLoss()
+
+        # ✅ 优化：简化数据加载器配置
+        train_loader = DataLoader(
+            self.dataset,
+            batch_size=self.config.get('batch_size', 32),
+            shuffle=True,
+            num_workers=0,
+            pin_memory=False
         )
 
-        return self.mask_proposal, self.priority
+        for _ in range(epochs):
+            for data, target in train_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                optimizer.zero_grad()
+                output = self.model(data)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
 
-    def prepare_upload_data(self, current_round: int,
-                            consensus_mask: List[int] = None) -> Dict[str, Any]:
-        """
-        准备上传数据：根据轮次决定上传掩码提案还是加密权重
-        """
-        if current_round % 2 != 0:
-            # 奇数轮：上传掩码提案
-            return {
-                'type': 'mask_proposal',
-                'mask_proposal': self.mask_proposal,
-                'priority': self.priority,
-                'data_size': self.data_size
-            }
-        else:
-            # 偶数轮：上传加密权重
-            if consensus_mask is None:
-                consensus_mask = []
+        # ✅ 获取本地权重
+        local_weights = {k: v for k, v in self.model.state_dict().items()}
+        weight_update = {k: local_weights[k] - global_weights[k] for k in global_weights}
 
-            processed_weights = self.processor.prepare_upload_weights(
-                self.local_weights, self.global_weights, consensus_mask
-            )
+        # ✅ 拜占庭攻击注入
+        if self.is_byzantine:
+            if self.attack_type == "random" or self.attack_type == "random_weights":
+                # 随机权重攻击
+                for k in local_weights:
+                    local_weights[k] = torch.randn_like(local_weights[k])
+                weight_update = {k: local_weights[k] - global_weights[k] for k in global_weights}
+                print(f"  😈 [Round {current_round}] 客户端 {self.client_id} 发起攻击: random_weights")
 
-            return {
-                'type': 'encrypted_weights',
-                'processed_weights': processed_weights,
-                'priority': self.priority,
-                'data_size': self.data_size
-            }
+            elif self.attack_type == "sign_flip":
+                # 符号翻转攻击
+                weight_update = {k: -v for k, v in weight_update.items()}
+                local_weights = {k: global_weights[k] + weight_update[k] for k in global_weights}
+                print(f"  😈 [Round {current_round}] 客户端 {self.client_id} 发起攻击: sign_flip")
 
-    def update_global_weights(self, global_weights: Dict[str, torch.Tensor]):
-        """更新全局权重"""
-        self.global_weights = global_weights
+            elif self.attack_type == "zero_update":
+                # 零更新攻击
+                weight_update = {k: torch.zeros_like(v) for k, v in weight_update.items()}
+                local_weights = copy.deepcopy(global_weights)
+                print(f"  😈 [Round {current_round}] 客户端 {self.client_id} 发起攻击: zero_update")
 
-    def _flatten_weights(self, weights_dict: Dict[str, torch.Tensor]) -> np.ndarray:
-        """展平权重字典"""
-        flattened = []
-        for tensor in weights_dict.values():
-            flattened.extend(tensor.detach().cpu().flatten().numpy())
-        return np.array(flattened)
+            elif self.attack_type == "scaled_update":
+                # 缩放更新攻击
+                scale = self.config.get('byzantine_attack_scale', 10.0)
+                weight_update = {k: scale * v for k, v in weight_update.items()}
+                local_weights = {k: global_weights[k] + weight_update[k] for k in global_weights}
+                print(f"  😈 [Round {current_round}] 客户端 {self.client_id} 发起攻击: scaled_update (×{scale})")
 
-    def _flatten_gradients(self, gradients_dict: Dict[str, torch.Tensor]) -> np.ndarray:
-        """展平梯度字典"""
-        flattened = []
-        for tensor in gradients_dict.values():
-            flattened.extend(tensor.detach().cpu().flatten().numpy())
-        return np.array(flattened)
+            else:
+                # 未知攻击类型，回退到随机权重
+                for k in local_weights:
+                    local_weights[k] = torch.randn_like(local_weights[k])
+                weight_update = {k: local_weights[k] - global_weights[k] for k in global_weights}
+                print(f"  ⚠️ [Round {current_round}] 客户端 {self.client_id} 使用未知攻击 '{self.attack_type}' → 回退到 random_weights")
 
-    def get_client_info(self) -> Dict[str, Any]:
-        """获取客户端信息"""
+        self.local_weights = local_weights
+        self.weight_update = weight_update
+
+        return local_weights, 0.0
+
+    def prepare_upload_data_simple(self, round_num):
         return {
-            'client_id': self.client_id,
-            'data_size': self.data_size,
-            'correlation': self.correlation,
-            'priority': self.priority,
-            'mask_proposal': self.mask_proposal
+            'local_weights': self.local_weights,
+            'weight_update': self.weight_update
         }
